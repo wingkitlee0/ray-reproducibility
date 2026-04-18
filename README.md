@@ -1,1 +1,93 @@
 # ray-reproducibility
+
+Examples demonstrating deterministic Ray Data ingestion, built on the
+`kit/repro-example` development branch of Ray.
+
+See [`guide.md`](./guide.md) for the design background.
+
+## Prerequisites
+
+An editable install of the development branch
+[`wingkitlee0/ray@kit/repro-example`](https://github.com/wingkitlee0/ray/tree/kit/repro-example)
+is required. It adds `include_row_hash` to `read_parquet` and
+`RandomSeedConfig` support to the iterator APIs.
+
+```bash
+# In your ray checkout, on the kit/repro-example branch:
+pip install -e python/
+```
+
+Then, from this repo:
+
+```bash
+pip install -e .
+```
+
+## Example 1: Reproducibility
+
+Demonstrates that a Ray Data pipeline produces a deterministic per-epoch
+row order across independent script invocations.
+
+```bash
+# Single run: prints a fingerprint per epoch.
+python -m ray_repro.example1_reproducibility --seed 42 --epochs 3
+
+# Two-run driver: runs the script twice in subprocesses and asserts that
+# the per-epoch fingerprints match exactly.
+python -m ray_repro.run_example1_twice --seed 42 --epochs 3
+```
+
+Expected behavior:
+
+- Two runs with the same `--seed` produce identical per-epoch fingerprints.
+- Within a single run, each epoch's fingerprint differs from the others
+  (thanks to `reseed_after_execution=True`).
+
+Ray is pinned to a single CPU (`--num-cpus 1`) so that task-completion
+ordering is naturally deterministic. Parallel execution would still
+produce the same *set* of rows per epoch but could reorder them across
+tasks; matching fingerprints there would require
+`DataContext.get_current().execution_options.preserve_order = True`.
+
+### Continuous ordering metrics
+
+To see *how much* parallelism perturbs ordering (rather than just "does
+the fingerprint match"), sweep over `--num-cpus` and compare against the
+`num_cpus=1` reference:
+
+```bash
+python -m ray_repro.compare_ordering \
+    --seed 42 --epochs 3 --num-cpus 1 2 4 8 \
+    --shuffle-buffer 32
+```
+
+Reported per `(num_cpus, epoch)`:
+
+- `exact_match_fraction` -- fraction of rows at the identical position.
+- `spearman_rho`         -- Spearman rank correlation (1.0 = identical,
+  ~0 = uncorrelated, -1.0 = reversed).
+- `displacement_score`   -- `1 - mean(|Δrank|) / E_random`, clamped to
+  `[0, 1]`. Captures the intuition that extra workers usually shuffle
+  rows *locally* rather than teleporting them across the epoch.
+
+Example sweep (N=2000 rows, 8 parquet files):
+
+```
+num_cpus |   exact | spearman | disp_score
+       1 |   1.000 |    1.000 |      1.000
+       2 |   0.001 |    0.759 |      0.501
+       4 |   0.000 |    0.492 |      0.327
+       8 |   0.000 |    0.589 |      0.379
+```
+
+#### Note on `randomize_block_order()`
+
+This stage is disabled by default (`enable_randomize_block_order=False`).
+It is an all-to-all operation: it gathers every `RefBundle` from
+upstream and applies a seeded shuffle. Because the *input list* to that
+shuffle depends on block arrival order (which is non-deterministic under
+parallelism), enabling it causes any parallelism to cascade into a
+globally different permutation -- the continuous ordering score
+collapses to ~0. Re-enable it with `--randomize-block-order` only when
+you also plan to set
+`DataContext.get_current().execution_options.preserve_order = True`.
