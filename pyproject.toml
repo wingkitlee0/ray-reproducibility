@@ -1,6 +1,6 @@
 [project]
 name = "ray-reproducibility"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Ray Data reproducibility and data-pipeline checkpointing examples."
 requires-python = ">=3.10"
 dependencies = [
@@ -12,14 +12,31 @@ dependencies = [
     "xxhash>=3.4",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ray_repro/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ray_repro"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/ray_repro",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.uv]
+# Ray is installed externally from a local editable checkout; do not let uv
+# manage it via this project's lockfile.
