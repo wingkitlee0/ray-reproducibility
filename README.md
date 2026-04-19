@@ -91,3 +91,45 @@ globally different permutation -- the continuous ordering score
 collapses to ~0. Re-enable it with `--randomize-block-order` only when
 you also plan to set
 `DataContext.get_current().execution_options.preserve_order = True`.
+
+## Example 2: Data Pipeline Checkpointing across Process Restarts
+
+Demonstrates a realistic crash/resume cycle: one process consumes some
+batches and exits, a fresh process restarts, and the rebuilt pipeline
+skips every row that was already consumed while continuing the reseed
+sequence from where it left off. Filtering is by `row_hash` (from
+`include_row_hash=True`), so it composes cleanly with both
+`FileShuffleConfig` and the local shuffle buffer.
+
+```bash
+# Clean single run: 3 epochs, fresh store.
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3 --reset
+
+# Simulated crash: finish epoch 0, consume 10 batches of epoch 1, exit 1.
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3 \
+    --reset --crash-after 1:10
+
+# Resume the above: no --reset, no --crash-after. The store's
+# current_epoch=1 and 640 pre-consumed row_hashes under epoch_1/ drive
+# the filter + drain logic automatically.
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3
+
+# End-to-end driver: runs the crash and resume subprocesses and asserts
+# every invariant (partial segment written, resume picks up at the right
+# epoch, per-epoch row sets are disjoint and union-complete, final
+# counters match the total number of completed epochs).
+python -m ray_repro.run_example2_crash_resume --seed 42 --total-epochs 3 \
+    --crash-after 1:10
+```
+
+Guarantees per epoch:
+
+- `union(segments) == expected_set` — no row dropped, even across a crash.
+- Segments are pairwise disjoint — no row consumed twice.
+
+`DataContext._execution_idx` is per-Dataset in Ray by design, so the
+example persists the counter (and the current epoch index) alongside the
+seen-hash segments and restores them before each rebuild. See
+[`docs/execution-idx-semantics.md`](docs/execution-idx-semantics.md) for
+the reasoning and `src/ray_repro/demo_exec_idx_roundtrip.py` for a
+minimal, checkpoint-store-free version of the same round-trip.

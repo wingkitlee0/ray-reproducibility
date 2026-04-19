@@ -151,7 +151,9 @@ filesystem-backed seen-hash store.
 
 This section summarizes what has been implemented for Example 1 in this repo,
 the design choices behind it, and the empirical behavior observed when
-sweeping `--num-cpus`. Example 2 has not been implemented yet.
+sweeping `--num-cpus`. See *Example 2 — Implementation Notes* below for the
+checkpoint/resume example and *`docs/execution-idx-semantics.md`* for the
+per-Dataset vs. driver-global discussion that shaped Example 2.
 
 ### Repository layout
 
@@ -320,3 +322,163 @@ python -m ray_repro.compare_ordering \
 - Per-epoch `row_hash` sequences can be dumped via `--sequences-dir` on
   `example1_reproducibility`; the sweep driver uses this to avoid
   re-running the pipeline just to compute metrics.
+
+## Example 2 — Implementation Notes
+
+### What the example demonstrates
+
+A realistic crash/resume story: one process consumes part of an epoch and
+dies, a *fresh* process restarts and continues from exactly where the
+first left off, skipping rows already consumed.
+
+Concretely, with ``--crash-after 1:10 --total-epochs 3``:
+
+1. Process A (fresh store): runs epoch 0 to completion, then consumes 10
+   batches (= 640 rows) of epoch 1 and exits with code 1.
+2. On-disk state after process A: 1 completed epoch's hashes, 1 partial
+   segment under ``epoch_1/``, ``current_epoch=1``, ``execution_idx=1``.
+3. Process B (no reset): reads the state, restores
+   ``DataContext._execution_idx = 1``, rebuilds the pipeline for epoch 1,
+   wraps it with a ``row_hash`` filter that drops the 640 already-seen
+   rows, drains the remaining 1360, then runs epoch 2 normally.
+4. Final state: every epoch's segment set covers the full 2000 rows
+   exactly once (disjoint + union-complete). ``current_epoch=3``,
+   ``execution_idx=3``.
+
+This matches the shape of training checkpointing: mid-epoch failures are
+resumed without either double-ingesting or dropping any rows.
+
+### Added pieces
+
+- `src/ray_repro/checkpoint_store.py` — `SeenHashStore`: parquet segments
+  under `epoch_{N}/` for consumed row hashes, plus top-level
+  `execution_idx.txt` and `current_epoch.txt` so a restarting process
+  knows which epoch to resume on and which seed to restore.
+- `src/ray_repro/common.py`:
+  - `filter_by_row_hash(ds, excluded)` drops rows whose `row_hash` is in
+    `excluded`. Implemented as `map_batches(...)` using `pc.is_in` at the
+    `pyarrow.Table` level; a `ds.filter(lambda row: ...)` path was tried
+    first but Ray Data's per-row predicate route serialized the hash into
+    a pickled bytes column, so batch-level Arrow filtering was required.
+  - `enumerate_row_hashes(data_dir)` returns every `row_hash` in canonical
+    read order (no shuffle). Used as ground truth.
+  - `run_epochs_with_resume(cfg, total_epochs, store, crash_at=...)` is
+    the resume-aware orchestrator: it reads `current_epoch` /
+    `execution_idx` from the store, runs each epoch by either starting
+    fresh (no segments yet) or continuing (existing segments filtered
+    out), optionally raises `CrashInjected` at the supplied
+    `(epoch, batches)` marker, and advances the counters only on
+    *completed* epochs.
+- `src/ray_repro/example2_checkpoint.py` — the CLI. Flags:
+  `--total-epochs`, `--crash-after EPOCH:BATCHES`, `--reset`,
+  `--store-root`, plus the usual `--seed` / `--batch-size` /
+  `--shuffle-buffer` / `--file-shuffle` / `--randomize-block-order` /
+  `--num-cpus` / `--json`. Returns exit code 1 when a crash is injected
+  (so an outer driver can detect the simulated failure), 0 on clean
+  completion.
+- `src/ray_repro/run_example2_crash_resume.py` — driver that runs the CLI
+  twice against a shared store (first with `--reset --crash-after ...`,
+  then with no reset and no crash) and asserts the full crash/resume
+  invariants.
+- `src/ray_repro/demo_file_shuffle_rebuild.py` and
+  `src/ray_repro/demo_exec_idx_roundtrip.py` — minimal scripts that
+  demonstrate, respectively, why naive `read_parquet(...)` rebuilds all
+  hit the same shuffle, and how a three-line pre-build / post-execute
+  round-trip fixes it.
+
+### Per-epoch invariants
+
+For every epoch `N` that completes (whether in one shot or across a
+crash/resume split), the orchestrator verifies:
+
+- `union of epoch_{N}/segment_*.parquet == expected_set` — no row dropped.
+- The segment sets are pairwise disjoint — no row consumed twice.
+- `rows_consumed == 2000` (= full fixture size).
+
+In the clean case an epoch has 1 segment and the above is trivial. In the
+crash-resume case the interrupted epoch has ≥2 segments (one per process
+that touched it) and the same invariants hold non-trivially.
+
+### State pieces and their scopes
+
+| State | Location | Scope | Reset when |
+| --- | --- | --- | --- |
+| Seen row hashes | `epoch_{N}/segment_*.parquet` | Per-epoch | `store.clear_epoch(N)` at the start of epoch `N` if you want fresh behavior; retained on a crash |
+| `_execution_idx` counter | `execution_idx.txt` | Per-run | Only `store.clear_all()` (invoked on `--reset`) |
+| Current epoch | `current_epoch.txt` | Per-run | Only `store.clear_all()` |
+
+The counter advances exactly once per *completed* epoch, so the reseed
+sequence is identical whether epoch `N` finished in one process or was
+split across two. The "current epoch" pointer only advances on successful
+completion, which is why a crashed run leaves it on the interrupted
+epoch and a resume knows to pick up there.
+
+### Why this needs user-managed checkpoint state (and not a Ray-side fix)
+
+`DataContext._execution_idx` is per-Dataset by design: a rebuilt
+`read_parquet(...)` is semantically a new pipeline and legitimately starts
+the counter at 0. Continuing the seed sequence across rebuilds is a
+checkpoint-resume concern, and checkpoint-resume state is the user's job.
+See [`docs/execution-idx-semantics.md`](docs/execution-idx-semantics.md)
+for the full discussion, including an earlier iteration of this example
+that tried to "fix" it with a driver-wide shared counter in Ray core and
+why that was reverted.
+
+The upshot: the only Ray-side changes this example depends on are the
+two already-landing PRs on `kit/repro-example` — `include_row_hash` and
+`iter_batches` local-shuffle reproducibility. There is no Ray-core
+bugfix piggybacking on Example 2.
+
+### Scripts and typical invocations
+
+Single run (clean, fresh store):
+
+```bash
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3 --reset
+```
+
+Single run with injected crash:
+
+```bash
+# Exits 1 after consuming 10 batches of epoch 1. Store is left in a
+# partially-consumed state.
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3 \
+    --reset --crash-after 1:10
+
+# Second invocation: no --reset, no --crash-after. Reads the stored
+# state, filters the 640 already-consumed rows out of epoch 1's rebuild,
+# drains the remainder, then runs epoch 2 normally.
+python -m ray_repro.example2_checkpoint --seed 42 --total-epochs 3
+```
+
+End-to-end crash/resume driver (runs both above in subprocesses and
+asserts all invariants):
+
+```bash
+python -m ray_repro.run_example2_crash_resume --seed 42 --total-epochs 3 \
+    --crash-after 1:10
+```
+
+Observed output on the 2000-row fixture:
+
+```
+[run 1 exits with code 1 after writing the partial segment]
+[run 2 resumes]
+
+epoch=1 segments=2 rows=2000/2000 disjoint=True union_ok=True fp=3ef65fe3c7a6f1c3:2000
+epoch=2 segments=1 rows=2000/2000 disjoint=True union_ok=True fp=e6d0624a69a0be74:2000
+
+Crash at epoch 1 after 10 batches: OK
+Resume picked up at epoch 1 and completed through epoch 2: OK
+Resumed epoch 1 has 2 segments (crash partial + resume remainder),
+    2000/2000 rows, disjoint + union OK
+Final store state: current_epoch=3 execution_idx=3
+All crash/resume invariants: OK
+```
+
+A nice cross-example consistency check: the epoch-2 fingerprint
+(`e6d0624a69a0be74:2000`) is identical to what a no-crash run produces
+and to what Example 1 would yield for its equivalent epoch under the
+same config. The damage of a mid-epoch crash is strictly bounded to the
+epoch that was interrupted; every subsequent epoch is bit-for-bit what
+an uninterrupted run would have produced.

@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 import ray
 import xxhash
-from ray.data import Dataset, FileShuffleConfig, RandomSeedConfig
+from ray.data import DataContext, Dataset, FileShuffleConfig, RandomSeedConfig
 
 
 @dataclass(frozen=True)
@@ -130,20 +130,72 @@ def fingerprint_epoch(batches: Iterable) -> str:
     return _format_fingerprint(h.hexdigest(), row_count)
 
 
-def collect_row_hashes(batches: Iterable) -> np.ndarray:
-    """Materialize the per-epoch ``row_hash`` sequence as a 1-D uint64 array.
+def collect_row_hashes(
+    batches: Iterable,
+    *,
+    max_batches: int | None = None,
+) -> np.ndarray:
+    """Materialize the ``row_hash`` sequence as a 1-D uint64 array.
 
     Order matches the order rows are yielded by the iterator -- i.e., the
-    exact ingestion order a training loop would see. Unlike
-    :func:`fingerprint_epoch`, this preserves enough information to compute
-    continuous ordering metrics against a reference sequence.
+    exact ingestion order a training loop would see. If ``max_batches`` is
+    set, iteration stops after that many batches (used by Example 2 to
+    simulate a mid-epoch checkpoint). Unlike :func:`fingerprint_epoch`, this
+    preserves enough information to compute ordering metrics or feed back
+    into a content-based filter.
     """
     chunks: list[np.ndarray] = []
-    for batch in batches:
+    for i, batch in enumerate(batches):
+        if max_batches is not None and i >= max_batches:
+            break
         chunks.append(np.asarray(batch["row_hash"], dtype=np.uint64))
     if not chunks:
         return np.empty(0, dtype=np.uint64)
     return np.concatenate(chunks)
+
+
+def filter_by_row_hash(
+    ds: Dataset,
+    excluded: Iterable[int] | np.ndarray,
+) -> Dataset:
+    """Return a dataset that drops rows whose ``row_hash`` is in ``excluded``.
+
+    Used by Example 2 to resume a partially-consumed epoch: the previously
+    seen row_hashes are passed here so the re-executed pipeline skips them.
+    Filtering happens at the ``pyarrow.Table`` level (via ``map_batches``
+    with ``pc.is_in``) so the ``uint64`` schema is preserved; a per-row
+    Python predicate would round-trip through object dicts and corrupt the
+    column. A production deployment would prefer a bloom filter or a
+    pushdown expression for larger exclusion sets.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(excluded, np.ndarray):
+        arr = np.asarray(excluded, dtype=np.uint64)
+    else:
+        arr = np.fromiter((int(h) for h in excluded), dtype=np.uint64)
+    if arr.size == 0:
+        return ds
+    excluded_pa = pa.array(arr, type=pa.uint64())
+
+    def _drop_seen(batch: "pa.Table") -> "pa.Table":
+        mask = pc.invert(pc.is_in(batch.column("row_hash"), value_set=excluded_pa))
+        return batch.filter(mask)
+
+    return ds.map_batches(_drop_seen, batch_format="pyarrow")
+
+
+def enumerate_row_hashes(data_dir: Path) -> np.ndarray:
+    """Return every ``row_hash`` the dataset contains, in canonical read order.
+
+    No shuffling is applied, so the result only depends on the fixture files
+    -- not on the current ``DataContext._execution_idx``. Example 2 uses this
+    as ground-truth when asserting that the union of pre-checkpoint and
+    post-resume rows equals the full epoch.
+    """
+    ds = ray.data.read_parquet(str(data_dir), include_row_hash=True)
+    return collect_row_hashes(ds.iter_batches(batch_format="pyarrow"))
 
 
 def run_epochs(
@@ -171,6 +223,219 @@ def run_epochs(
             np.save(sequences_dir / f"epoch_{epoch}.npy", seq)
         fingerprints.append(fingerprint_sequence(seq))
     return fingerprints
+
+
+@dataclass(frozen=True)
+class EpochResult:
+    """Outcome of one epoch after it has been fully consumed (possibly across
+    multiple processes via crash/resume).
+
+    ``segments`` is the number of on-disk segments that together cover the
+    epoch's row set -- ``1`` for an epoch that ran to completion in a single
+    process, ``2+`` for epochs that were interrupted and resumed (one
+    segment per crash).
+
+    Invariants (checked by :func:`run_epochs_with_resume`):
+
+    - ``rows_consumed == expected_rows``: the epoch covered every fixture
+      row exactly once.
+    - ``segments_disjoint``: no row appears in more than one segment, i.e.
+      phase-N always saw rows phase-(<N) did not.
+    - ``union_equals_expected``: union across segments equals the fixture.
+    """
+
+    epoch: int
+    segments: int
+    rows_consumed: int
+    expected_rows: int
+    segments_disjoint: bool
+    union_equals_expected: bool
+    concat_fingerprint: str
+
+
+class CrashInjected(Exception):
+    """Raised internally to simulate a process crash mid-epoch.
+
+    Caught only by the CLI entry point, which translates it to a non-zero
+    exit code so an outer driver can observe the "crash" as a real
+    subprocess failure without Python printing a traceback for expected
+    demo behavior.
+    """
+
+    def __init__(self, epoch: int, batches_consumed: int):
+        super().__init__(
+            f"simulated crash after {batches_consumed} batches of epoch {epoch}"
+        )
+        self.epoch = epoch
+        self.batches_consumed = batches_consumed
+
+
+def _set_execution_idx(idx: int) -> None:
+    """Set the per-process ``DataContext._execution_idx``.
+
+    Every subsequently constructed ``Dataset`` will copy this value into its
+    private context and use it to derive reseeded shuffle keys. This is the
+    hook the checkpoint-resume contract hangs off (see
+    ``docs/execution-idx-semantics.md``).
+    """
+    DataContext.get_current()._execution_idx = int(idx)
+
+
+def _read_execution_idx(ds: Dataset) -> int:
+    """Read ``_execution_idx`` from a Dataset's private plan context.
+
+    This peeks past the public API intentionally: after execution, the
+    counter lives on ``ds._plan._context`` (where Ray's callbacks bumped
+    it), not on the global ``DataContext``. There is no public getter yet,
+    but the shape of the field has been stable.
+    """
+    return int(ds._plan._context._execution_idx)
+
+
+def _consume_epoch(
+    cfg: PipelineConfig,
+    epoch: int,
+    store,
+    *,
+    execution_idx: int,
+    crash_after_batches: int | None,
+) -> np.ndarray:
+    """Run one epoch from its current on-disk state to (ideally) completion.
+
+    If segments already exist under ``epoch`` in the store, we are resuming:
+    build the dataset, wrap it with :func:`filter_by_row_hash` so those rows
+    are dropped, and iterate what remains. Otherwise iterate the full
+    dataset.
+
+    If ``crash_after_batches`` is reached before the epoch completes, the
+    batches consumed so far are appended as a new segment, the current
+    epoch is stamped to the store (so a resuming process knows not to
+    advance past it), and :class:`CrashInjected` is raised. The caller is
+    expected to exit non-zero at that point.
+
+    On successful completion the new batch's hashes are appended as the
+    final segment for this epoch and returned.
+    """
+    _set_execution_idx(execution_idx)
+    seen = store.load_epoch(epoch)
+
+    ds = build_dataset(cfg)
+    if seen.size > 0:
+        ds = filter_by_row_hash(ds, seen)
+
+    chunks: list[np.ndarray] = []
+    for i, batch in enumerate(iter_epoch_batches(ds, cfg)):
+        chunks.append(np.asarray(batch["row_hash"], dtype=np.uint64))
+        if crash_after_batches is not None and (i + 1) >= crash_after_batches:
+            partial = (
+                np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
+            )
+            store.append(epoch, partial)
+            store.save_current_epoch(epoch)
+            raise CrashInjected(epoch=epoch, batches_consumed=i + 1)
+
+    final_segment = (
+        np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
+    )
+    store.append(epoch, final_segment)
+    return final_segment
+
+
+def run_epochs_with_resume(
+    cfg: PipelineConfig,
+    total_epochs: int,
+    store,
+    *,
+    crash_at: tuple[int, int] | None = None,
+) -> list[EpochResult]:
+    """Drive the checkpoint/resume pipeline to ``total_epochs`` epochs.
+
+    The on-disk state in ``store`` is the source of truth for where work
+    left off:
+
+    - ``current_epoch``: the epoch to resume on. Zero on a fresh store.
+    - ``execution_idx``: the seed-advancing counter that is restored into
+      ``DataContext`` before every rebuild so reseeded shuffles continue
+      the sequence across rebuilds. Only advanced once per *completed*
+      epoch.
+    - ``epoch_{N}/segment_*.parquet``: row hashes already consumed for
+      epoch ``N``. A non-empty set means "we crashed partway through this
+      epoch; filter these rows out and drain the rest".
+
+    ``crash_at`` simulates a mid-epoch crash at ``(epoch, batches_consumed)``
+    for demo purposes. When the marker is reached, partial state is
+    flushed and :class:`CrashInjected` is raised; outer callers that want
+    to simulate a real process exit should let it propagate.
+
+    Returns one :class:`EpochResult` per epoch completed in *this* call
+    (i.e. excluding epochs that were already finished in a prior run).
+    """
+    expected = enumerate_row_hashes(cfg.data_dir)
+    expected_set = set(int(x) for x in expected)
+
+    current_epoch = store.load_current_epoch()
+    execution_idx = store.load_execution_idx()
+    results: list[EpochResult] = []
+
+    for epoch in range(current_epoch, total_epochs):
+        per_epoch_crash: int | None = None
+        if crash_at is not None and crash_at[0] == epoch:
+            per_epoch_crash = crash_at[1]
+
+        _consume_epoch(
+            cfg,
+            epoch,
+            store,
+            execution_idx=execution_idx,
+            crash_after_batches=per_epoch_crash,
+        )
+
+        all_hashes = store.load_epoch(epoch)
+        segment_sets = _segment_sets(store, epoch)
+        union = set().union(*segment_sets) if segment_sets else set()
+        segments_disjoint = sum(len(s) for s in segment_sets) == len(union)
+
+        results.append(
+            EpochResult(
+                epoch=epoch,
+                segments=len(segment_sets),
+                rows_consumed=len(union),
+                expected_rows=len(expected_set),
+                segments_disjoint=segments_disjoint,
+                union_equals_expected=union == expected_set,
+                concat_fingerprint=fingerprint_sequence(all_hashes),
+            )
+        )
+
+        execution_idx += 1
+        store.save_execution_idx(execution_idx)
+        store.save_current_epoch(epoch + 1)
+
+    return results
+
+
+def _segment_sets(store, epoch: int) -> list[set[int]]:
+    """Return one ``set[int]`` per on-disk segment for ``epoch``.
+
+    Kept separate so tests / metrics can distinguish between "one full
+    segment" (clean run) and "phase-1 + phase-2 segments" (crash and
+    resume).
+    """
+    import pyarrow.parquet as pq
+
+    d = store.epoch_dir(epoch)
+    if not d.exists():
+        return []
+    files = sorted(d.glob("segment_*.parquet"))
+    return [
+        set(
+            int(x)
+            for x in np.asarray(
+                pq.read_table(f, columns=["row_hash"])["row_hash"], dtype=np.uint64
+            )
+        )
+        for f in files
+    ]
 
 
 def _reference_positions(observed: np.ndarray, reference: np.ndarray) -> np.ndarray:
