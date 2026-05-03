@@ -31,8 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import ordering_metrics
-from .fixture import default_data_dir, generate_dataset
+from .common import default_data_dir, ordering_metrics
+from .fixture import generate_dataset
 
 
 def _run_example1(
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="If provided, copy dumped sequences under this directory instead "
-             "of discarding them when the driver exits.",
+        "of discarding them when the driver exits.",
     )
     parser.add_argument(
         "--file-shuffle",
@@ -195,9 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         avg_exact = sum(m["exact_match_fraction"] for m in ms) / len(ms)
         avg_rho = sum(m["spearman_rho"] for m in ms) / len(ms)
         avg_disp = sum(m["displacement_score"] for m in ms) / len(ms)
-        print(
-            f"{nc:>8} | {avg_exact:>7.3f} | {avg_rho:>8.3f} | {avg_disp:>10.3f}"
-        )
+        print(f"{nc:>8} | {avg_exact:>7.3f} | {avg_rho:>8.3f} | {avg_disp:>10.3f}")
 
     return 0
 

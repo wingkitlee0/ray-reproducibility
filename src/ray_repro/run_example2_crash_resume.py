@@ -35,7 +35,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .fixture import default_data_dir, generate_dataset
+from .common import default_data_dir
+from .fixture import generate_dataset
 
 
 def _run_subprocess(
@@ -82,7 +83,11 @@ def _run_subprocess(
     sys.stderr.write(proc.stderr)
 
     json_line = next(
-        (line for line in reversed(proc.stdout.splitlines()) if line.strip().startswith("{")),
+        (
+            line
+            for line in reversed(proc.stdout.splitlines())
+            if line.strip().startswith("{")
+        ),
         None,
     )
     if json_line is None:
@@ -199,9 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    resumed_epoch_result = next(
-        e for e in resumed_epochs if e["epoch"] == crash_epoch
-    )
+    resumed_epoch_result = next(e for e in resumed_epochs if e["epoch"] == crash_epoch)
     if resumed_epoch_result["segments"] != 2:
         print(
             f"[driver] FAIL: resumed epoch {crash_epoch} should have 2 segments "
@@ -212,8 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     all_invariants_ok = all(
-        e["segments_disjoint"] and e["union_equals_expected"]
-        for e in resumed_epochs
+        e["segments_disjoint"] and e["union_equals_expected"] for e in resumed_epochs
     )
     if not all_invariants_ok:
         print(
@@ -242,9 +244,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("=" * 70)
-    print(
-        f"Crash at epoch {crash_epoch} after {crash_batches} batches: OK"
-    )
+    print(f"Crash at epoch {crash_epoch} after {crash_batches} batches: OK")
     print(
         f"Resume picked up at epoch {crash_epoch} and completed through "
         f"epoch {args.total_epochs - 1}: OK"
@@ -256,10 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{resumed_epoch_result['expected_rows']} rows, "
         f"disjoint + union OK"
     )
-    print(
-        f"Final store state: current_epoch={final_epoch} "
-        f"execution_idx={final_idx}"
-    )
+    print(f"Final store state: current_epoch={final_epoch} execution_idx={final_idx}")
     print("All crash/resume invariants: OK")
     return 0
 

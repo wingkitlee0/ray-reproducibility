@@ -19,8 +19,8 @@ from pathlib import Path
 
 import ray
 
-from .common import PipelineConfig, run_epochs
-from .fixture import default_data_dir, generate_dataset
+from .common import PipelineConfig, default_data_dir, run_epochs
+from .fixture import generate_dataset
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,9 +92,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ray.init(num_cpus=args.num_cpus, ignore_reinit_error=True, log_to_driver=False)
     try:
-        fingerprints = run_epochs(
-            cfg, args.epochs, sequences_dir=args.sequences_dir
-        )
+        fingerprints = run_epochs(cfg, args.epochs, sequences_dir=args.sequences_dir)
     finally:
         ray.shutdown()
 

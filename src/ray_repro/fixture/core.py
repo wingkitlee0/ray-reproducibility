@@ -1,18 +1,13 @@
-"""Generate a small synthetic Parquet dataset for the examples.
-
-The dataset is intentionally tiny and split across multiple files so that
-`FileShuffleConfig` has something meaningful to permute.
-"""
-
-from __future__ import annotations
-
-import argparse
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+from . import DEFAULT_RANDOM_SEED
 
 
 def generate_dataset(
@@ -21,6 +16,7 @@ def generate_dataset(
     num_files: int = 8,
     rows_per_file: int = 250,
     overwrite: bool = True,
+    seed: Optional[int] = DEFAULT_RANDOM_SEED,
 ) -> Path:
     """Generate ``num_files`` Parquet files under ``out_dir``.
 
@@ -44,26 +40,3 @@ def generate_dataset(
         table = pa.table({"id": ids, "value": values})
         pq.write_table(table, out_dir / f"part-{file_idx:04d}.parquet")
     return out_dir
-
-
-def default_data_dir() -> Path:
-    """Default fixture path, scoped to this repo."""
-    return Path(__file__).resolve().parents[2] / "data" / "fixture"
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", type=Path, default=default_data_dir())
-    parser.add_argument("--num-files", type=int, default=8)
-    parser.add_argument("--rows-per-file", type=int, default=250)
-    args = parser.parse_args()
-    path = generate_dataset(
-        args.out_dir,
-        num_files=args.num_files,
-        rows_per_file=args.rows_per_file,
-    )
-    print(f"Wrote {args.num_files} files ({args.num_files * args.rows_per_file} rows) to {path}")
-
-
-if __name__ == "__main__":
-    main()

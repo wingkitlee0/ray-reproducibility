@@ -12,6 +12,16 @@ import xxhash
 from ray.data import DataContext, Dataset, FileShuffleConfig, RandomSeedConfig
 
 
+def default_data_dir() -> Path:
+    """Default fixture path, resolved from the current working directory.
+
+    Using CWD (rather than ``__file__``) keeps the default predictable
+    regardless of where this package lives on disk and survives the
+    package being moved or pip-installed.
+    """
+    return Path.cwd() / "data" / "fixture"
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     """User-facing knobs for the deterministic pipeline.
@@ -327,16 +337,12 @@ def _consume_epoch(
     for i, batch in enumerate(iter_epoch_batches(ds, cfg)):
         chunks.append(np.asarray(batch["row_hash"], dtype=np.uint64))
         if crash_after_batches is not None and (i + 1) >= crash_after_batches:
-            partial = (
-                np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
-            )
+            partial = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
             store.append(epoch, partial)
             store.save_current_epoch(epoch)
             raise CrashInjected(epoch=epoch, batches_consumed=i + 1)
 
-    final_segment = (
-        np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
-    )
+    final_segment = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
     store.append(epoch, final_segment)
     return final_segment
 
@@ -509,7 +515,9 @@ def ordering_metrics(observed: np.ndarray, reference: np.ndarray) -> dict[str, f
 
     if n > 1:
         rho = float(
-            np.corrcoef(obs_positions.astype(np.float64), ideal.astype(np.float64))[0, 1]
+            np.corrcoef(obs_positions.astype(np.float64), ideal.astype(np.float64))[
+                0, 1
+            ]
         )
     else:
         rho = 1.0

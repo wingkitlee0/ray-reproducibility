@@ -7,13 +7,15 @@ With `reseed_after_execution=True`, each epoch should see a DIFFERENT file order
 On master this fails because `DataContext.copy()` gives every new Dataset a fresh
 copy of the still-zero global `_execution_idx`.
 """
+
 from __future__ import annotations
 
 import ray
 from ray.data import DataContext
 from ray.data.datasource import FileShuffleConfig
 
-from .fixture import default_data_dir, generate_dataset
+from .common import default_data_dir
+from .fixture import generate_dataset
 
 
 def first_file_of_epoch(data_dir: str, seed: int, epoch: int) -> str:

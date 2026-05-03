@@ -3,13 +3,15 @@
 Simulates checkpoint/resume by manually setting the global _execution_idx before
 each rebuild, then reading the final value off ds._plan._context after iteration.
 """
+
 from __future__ import annotations
 
 import ray
 from ray.data import DataContext
 from ray.data.datasource import FileShuffleConfig
 
-from .fixture import default_data_dir, generate_dataset
+from .common import default_data_dir
+from .fixture import generate_dataset
 
 
 def one_epoch(data_dir: str, seed: int, starting_idx: int) -> tuple[str, int]:
@@ -34,7 +36,9 @@ def main() -> None:
     try:
         saved_idx = 0
         for epoch in range(4):
-            first_file, before, after = one_epoch(data_dir, seed=42, starting_idx=saved_idx)
+            first_file, before, after = one_epoch(
+                data_dir, seed=42, starting_idx=saved_idx
+            )
             print(
                 f"epoch {epoch}: start_idx={saved_idx}  ds.ctx before={before}  "
                 f"first_file={first_file}  ds.ctx after={after}"

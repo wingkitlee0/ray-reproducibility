@@ -31,8 +31,8 @@ from pathlib import Path
 import ray
 
 from .checkpoint_store import SeenHashStore
-from .common import CrashInjected, PipelineConfig, run_epochs_with_resume
-from .fixture import default_data_dir, generate_dataset
+from .common import CrashInjected, PipelineConfig, default_data_dir, run_epochs_with_resume
+from .fixture import generate_dataset
 
 
 def _default_store_root() -> Path:

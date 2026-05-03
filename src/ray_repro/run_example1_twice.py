@@ -14,7 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .fixture import default_data_dir, generate_dataset
+from .common import default_data_dir
+from .fixture import generate_dataset
 
 
 def _run_once(
@@ -90,7 +91,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print()
-    print("epoch | run A                                | run B                                | match")
+    print(
+        "epoch | run A                                | run B                                | match"
+    )
     all_match = True
     for epoch, (a, b) in enumerate(zip(fps_a, fps_b)):
         match = a == b
